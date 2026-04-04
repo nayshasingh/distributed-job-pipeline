@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: job-worker
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      client-id: ${spring.application.name}-producer
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 3
+      properties:
+        enable.idempotence: true
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP_ID:job-worker}
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      timeout: ${REDIS_COMMAND_TIMEOUT:2s}
+  datasource:
+    url: jdbc:postgresql://localhost:5432/jobscheduler
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:123}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
+
+app:
+  kafka:
+    job-queue-high-topic: ${KAFKA_JOB_QUEUE_HIGH_TOPIC:job-queue-high}
+    job-queue-low-topic: ${KAFKA_JOB_QUEUE_LOW_TOPIC:job-queue-low}
+    consumer-groups:
+      high: ${KAFKA_CONSUMER_GROUP_HIGH:job-worker-high}
+      low: ${KAFKA_CONSUMER_GROUP_LOW:job-worker-low}
+  worker:
+    # Total execution attempts (first consume + Kafka re-publishes). Default 4 = initial run + up to 3 retries.
+    max-execution-attempts: ${JOB_WORKER_MAX_EXECUTION_ATTEMPTS:4}
+    # Redis lock key = prefix + jobId. TTL bounds how long a crashed worker can block others.
+    distributed-lock-key-prefix: ${JOB_WORKER_LOCK_KEY_PREFIX:job-worker:exec:}
+    distributed-lock-ttl-seconds: ${JOB_WORKER_LOCK_TTL_SECONDS:600}
+
+logging:
+  level:
+    com.distributedjob.worker: INFO
