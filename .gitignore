@@ -1,0 +1,21 @@
+# Maven
+**/target/
+
+# Node
+**/node_modules/
+job-dashboard/dist/
+**/.vite/
+
+# Env and secrets (keep .env.example tracked)
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# OS / IDE
+.DS_Store
+.idea/
+*.iml
+.vscode/
+*.swp
+*.log
