@@ -1,10 +1,154 @@
 # Architecture and end-to-end workflow
 
-This document describes **every major component** of the distributed job processing demo and how **requests, messages, and state** move through the system.
+This document has **two layers**:
+
+1. **Navigate the codebase** — what each folder and file is for (read this if opening the project feels overwhelming).
+2. **How data moves** — HTTP → database → Kafka → worker → Redis → database again.
+
+If you are new to the stack, read **sections 0 → 3** first, then skim the diagrams, then read **section 8** while you have the listed files open in your editor.
 
 ---
 
-## 1. System overview
+## 0. How to read this document
+
+| Section | Purpose |
+|---------|---------|
+| [1 — Repository root](#1-repository-root-what-sits-at-the-top-level) | What `docker-compose.yml`, each app folder, and `docs/` mean. |
+| [2 — Scheduler files](#2-distributed-job-scheduler-file-by-file) | Every Java file in the API project, in plain language. |
+| [3 — Worker files](#3-job-worker-file-by-file) | Every Java file in the worker project. |
+| [4 — Dashboard & scripts](#4-job-dashboard-and-root-scripts) | React UI and helper shell script. |
+| [5 — Config files](#5-configuration-files-applicationyml) | What the YAML settings are doing. |
+| [6–7](#6-system-overview-diagram) | Diagrams + database columns. |
+| [8](#8-follow-one-request-postjobs-with-exact-file-paths) | **Line-by-line story** of one job from curl to completion. |
+| [11 — Glossary](#11-glossary) | Short definitions (Kafka topic, consumer group, JPA, …). |
+
+---
+
+## 1. Repository root (what sits at the top level)
+
+```text
+.
+├── README.md                 # How to run, env vars, troubleshooting
+├── docker-compose.yml        # Starts Postgres, Redis, Zookeeper, Kafka locally
+├── .gitignore                # Ignores target/, node_modules/, .env, …
+├── distributed-job-scheduler/# Spring Boot **API** (Maven)
+├── job-worker/               # Spring Boot **worker** (Maven) — no HTTP API
+├── job-dashboard/            # React **UI** (npm) — optional
+├── docs/                     # This file, learning links, git push notes
+└── scripts/
+    └── demo-burst-jobs.sh    # Fires many POST /jobs in parallel for demos
+```
+
+- **Two JVM apps** (`distributed-job-scheduler`, `job-worker`) share the **same Postgres database** and **same `jobs` table**. Only the **scheduler** auto-creates/updates the table (Hibernate `ddl-auto: update`). The **worker** expects the table to exist (`validate`).
+- **Kafka** is the pipe between them for the main demo path: scheduler **writes** messages, worker **reads** them.
+- **Redis** is only used by the **worker** for short-lived **locks** (not for storing jobs).
+
+---
+
+## 2. `distributed-job-scheduler` — file by file
+
+Root: `distributed-job-scheduler/src/main/java/com/distributedjob/scheduler/`
+
+| Path (under `scheduler/`) | What it does |
+|---------------------------|--------------|
+| **`DistributedJobSchedulerApplication.java`** | `main()` entry point. Running this starts Spring Boot and loads every `@Component`, `@Service`, `@RestController`. |
+| **`controller/JobController.java`** | Maps **`/jobs`**: `POST` create job, `GET` list, `GET /{id}`, `POST /{id}/retry`. Delegates everything to `JobService`. |
+| **`controller/WorkerJobController.java`** | Maps **`/api/workers/jobs/...`**: optional **pull** API (`claim-next`, `complete`) for workers that do **not** use Kafka. |
+| **`service/JobService.java`** | Core logic: save job, publish `JobCreatedEvent`, retry failed jobs, claim/complete for REST workers. Annotated with `@Transactional` where DB changes must be atomic. |
+| **`repository/JobRepository.java`** | Spring Data JPA interface — Spring generates SQL for `save`, `findById`, custom queries like “next pending job for claim.” |
+| **`entity/Job.java`** | JPA entity = one row shape for table **`jobs`** (id, jobType, payload JSON string, status, priority, retryCount, timestamps). |
+| **`entity/JobStatus.java`** | Enum: `PENDING`, `RUNNING`, `SUCCESS`, `FAILED`. |
+| **`entity/JobPriority.java`** | Enum: `HIGH`, `LOW`. |
+| **`dto/JobSubmissionRequest.java`** | JSON body for `POST /jobs` (validated). |
+| **`dto/JobResponse.java`** | JSON returned to clients (job id, status, etc.). |
+| **`dto/JobCompletionRequest.java`** | JSON for REST worker `complete` endpoint. |
+| **`kafka/JobCreatedEvent.java`** | Small **immutable record** passed to Spring’s event bus when a job should be announced to Kafka (holds jobId, jobType, priority). |
+| **`kafka/JobCreatedKafkaPublisher.java`** | Listens for `JobCreatedEvent` with **`@TransactionalEventListener(phase = AFTER_COMMIT)`** — calls the producer **only after** the database transaction committed. |
+| **`kafka/JobQueueKafkaProducer.java`** | Uses Spring’s **`KafkaTemplate`** to send a JSON string to **`job-queue-high`** or **`job-queue-low`**. |
+| **`kafka/JobQueueMessage.java`** | Java record / DTO for what goes on the wire (`jobId`, `jobType`, `priority`). |
+| **`config/KafkaTopicConfig.java`** | **`@Bean`** that registers the two Kafka **topics** when the app starts (for local dev). |
+| **`config/KafkaTopicsProperties.java`** | Binds `application.yml` keys under `app.kafka` (topic names). |
+| **`config/WebCorsConfig.java`** | Allows browsers (e.g. dashboard on port 3000/5173) to call the API. |
+| **`config/OpenApiConfig.java`** | Swagger / OpenAPI title and version. |
+
+**Resources:** `distributed-job-scheduler/src/main/resources/application.yml` — ports, datasource, Kafka bootstrap, topic names (see [§5](#5-configuration-files-applicationyml)).
+
+**Build:** `distributed-job-scheduler/pom.xml` — dependencies (web, JPA, Kafka, PostgreSQL driver, springdoc).
+
+---
+
+## 3. `job-worker` — file by file
+
+Root: `job-worker/src/main/java/com/distributedjob/worker/`
+
+| Path (under `worker/`) | What it does |
+|------------------------|--------------|
+| **`JobWorkerApplication.java`** | `main()` — starts Spring Boot; enables Kafka listeners. |
+| **`kafka/FairPriorityJobIngress.java`** | **Heart of consumption:** two **`@KafkaListener`** methods (one topic + consumer group per priority lane). Each puts work on an internal **queue**; a **background thread** takes jobs in a **3 HIGH : 1 LOW** pattern and calls `JobProcessingService`. Kafka **ack** happens only after processing returns. |
+| **`kafka/JobQueueKafkaProducer.java`** | On retry, sends another message to the **same** high/low topic as the job’s priority. |
+| **`kafka/JobQueueMessage.java`** | Same JSON shape as scheduler (parsed from consumer record). |
+| **`service/JobProcessingService.java`** | **`processQueuedJob`**: try **Redis lock** → **`JobStateService.tryClaimPending`** → **`MockJobTaskExecutor.execute`** → success or **`recordExecutionFailure`** (maybe re-publish to Kafka). **`finally`**: release Redis lock. |
+| **`service/JobStateService.java`** | All **`@Transactional`** updates to the `jobs` row: claim PENDING→RUNNING, set SUCCESS, or handle failure + retry count. |
+| **`service/JobDistributedLockService.java`** | Talks to Redis: **`SET` key with NX + expiry**, unlock with Lua script + token. |
+| **`service/MockJobTaskExecutor.java`** | Fake work: log, sleep for `SLOW_JOB`, throw for `FAILING_JOB`, etc. Replace with real integrations in a real system. |
+| **`service/ExecutionFailureResult.java`** | Small type used when deciding “requeue vs FAILED.” |
+| **`repository/JobRepository.java`** | JPA + one **`@Modifying` query** `claimIfStatus` — updates row **only if** status is still `PENDING` (helps with duplicate messages). |
+| **`entity/Job.java`**, **`JobStatus.java`**, **`JobPriority.java`** | Mirror of scheduler’s model so Hibernate can read the **same** table (`validate` mode). |
+| **`config/KafkaConsumerConfig.java`** | Factory for listeners: **manual ack**, **`syncCommits=false`** so the thread that processes can ack on another thread (fair dispatcher pattern). |
+| **`config/WorkerKafkaTopicsProperties.java`** | Topic names + consumer **group ids** from YAML. |
+| **`config/WorkerProperties.java`** | Lock prefix, TTL, max execution attempts. |
+
+**Resources:** `job-worker/src/main/resources/application.yml` — datasource, Kafka consumer/producer, Redis, worker tuning.
+
+**Build:** `job-worker/pom.xml`.
+
+---
+
+## 4. `job-dashboard` and root scripts
+
+| Path | What it does |
+|------|--------------|
+| **`job-dashboard/src/main.jsx`** | React entry — mounts `<App />`. |
+| **`job-dashboard/src/App.jsx`** | Renders the main page (usually `Dashboard`). |
+| **`job-dashboard/src/pages/Dashboard.jsx`** | Lists jobs (polling), summary cards, embeds form/table/filters. |
+| **`job-dashboard/src/services/api.js`** | Axios client: `fetchJobs`, `createJob` — hits `/jobs` (dev proxy forwards to Spring). |
+| **`job-dashboard/src/components/JobForm.jsx`** | Form to POST a new job. |
+| **`job-dashboard/src/components/JobTable.jsx`** | Table of jobs. |
+| **`job-dashboard/src/components/Filters.jsx`** | Client-side filter UI. |
+| **`job-dashboard/vite.config.js`** | Dev server + **`proxy`** using `VITE_API_PROXY_TARGET` so `/jobs` goes to the API. |
+| **`job-dashboard/package.json`** | Scripts: `npm run dev`, dependencies (React, Axios, Tailwind, …). |
+| **`job-dashboard/.env.example`** | Example env vars (copy to `.env` locally; real `.env` is gitignored). |
+| **`scripts/demo-burst-jobs.sh`** | Shell loop / parallel `curl` to stress-test POST /jobs. |
+
+---
+
+## 5. Configuration files (`application.yml`)
+
+You do **not** need to memorize every key — use this as a map when something fails to connect.
+
+### Scheduler (`distributed-job-scheduler/src/main/resources/application.yml`)
+
+Typical blocks:
+
+- **`server.port`** — HTTP port (often `8080`, overridable with `SERVER_PORT`).
+- **`spring.datasource.*`** — JDBC URL, username, password → **Postgres**.
+- **`spring.jpa.hibernate.ddl-auto: update`** — Hibernate creates/updates **`jobs`** table to match `Job.java`.
+- **`spring.kafka.bootstrap-servers`** — where Kafka listens (e.g. `localhost:9092`).
+- **`app.kafka.*`** — names of **high** and **low** topics (must match worker).
+
+### Worker (`job-worker/src/main/resources/application.yml`)
+
+- **`spring.datasource.*`** — **same database** as scheduler.
+- **`spring.jpa.hibernate.ddl-auto: validate`** — **do not** change schema; fail fast if table missing/wrong.
+- **Kafka consumer** — `group-id` differs per lane (`job-worker-high` vs `job-worker-low`); subscribe to high/low topics.
+- **Redis** — host/port for **`JobDistributedLockService`**.
+- **`app.worker.*`** — lock key prefix, TTL seconds, **`max-execution-attempts`** for retries.
+
+Environment variables in README often **override** these YAML values — same names, different layer.
+
+---
+
+## 6. System overview (diagram)
 
 ```mermaid
 flowchart TB
@@ -19,7 +163,7 @@ flowchart TB
     WJC[WorkerJobController]
     JS[JobService]
     JR_API[JobRepository]
-    KProd[JobQueueKafkaPublisher]
+    KProd[JobQueueKafkaProducer]
     KPub[JobCreatedKafkaPublisher]
   end
 
@@ -65,153 +209,124 @@ flowchart TB
   KProdW --> KL
 ```
 
-**Legend**
-
 | Box | Role |
 |-----|------|
 | **distributed-job-scheduler** | HTTP API, owns DB schema (`ddl-auto: update`), publishes to Kafka **after** DB commit. |
 | **job-worker** | Consumes Kafka (two lanes + fair merge), uses Redis + DB to execute jobs and handle retries. |
-| **PostgreSQL** | Single source of truth for job rows (`jobs` table). |
+| **PostgreSQL** | Source of truth for job rows (`jobs` table). |
 | **Kafka** | Two topics for priority lanes; buffers work between API and workers. |
-| **Redis** | Distributed lock per `jobId` to reduce duplicate execution across JVMs. |
+| **Redis** | Lock per `jobId` to reduce duplicate execution across JVMs. |
 | **job-dashboard** | Optional React UI; proxies `/jobs` to the API in dev. |
 
 ---
 
-## 2. Components (by repository)
-
-### 2.1 `distributed-job-scheduler` (API)
-
-| Piece | Responsibility |
-|-------|------------------|
-| **`JobController`** (`/jobs`) | `POST` create, `GET` list, `GET /{id}`, `POST /{id}/retry`. |
-| **`WorkerJobController`** (`/api/workers/jobs`) | Optional **pull** model: `claim-next`, `complete` — same DB, no Kafka in that path. |
-| **`JobService`** | Business logic: validate, persist, publish `JobCreatedEvent`, claim/complete for REST workers. |
-| **`Job` / `JobStatus` / `JobPriority`** | JPA entity + enums; maps to `jobs` table. |
-| **`JobRepository`** | Spring Data JPA; `findPendingForClaim` orders **HIGH** first, then **createdAt** (for REST claim). |
-| **`JobSubmissionRequest` / `JobResponse` / DTOs** | HTTP JSON contracts. |
-| **`JobCreatedEvent`** | Published inside a transaction; carries `jobId`, `jobType`, `priority`. |
-| **`JobCreatedKafkaPublisher`** | `@TransactionalEventListener(AFTER_COMMIT)` → calls producer only if DB commit succeeded. |
-| **`JobQueueKafkaProducer`** | Serializes `JobQueueMessage` JSON; sends to **`job-queue-high`** or **`job-queue-low`** from `priority`. |
-| **`JobQueueMessage`** | Kafka value: `{ jobId, jobType, priority }`; missing `priority` in JSON → **LOW**. |
-| **`KafkaTopicConfig`** | Declares both topics (partitions/replicas for local dev). |
-| **`KafkaTopicsProperties`** | `app.kafka.job-queue-high-topic`, `job-queue-low-topic`. |
-| **`WebCorsConfig`** | Browser access from dashboard origins. |
-| **`OpenApiConfig`** | Swagger / OpenAPI metadata. |
-
-### 2.2 `job-worker`
-
-| Piece | Responsibility |
-|-------|------------------|
-| **`FairPriorityJobIngress`** | Two `@KafkaListener`s (topics **high** / **low**, **different consumer groups**). Enqueues into in-memory **HIGH** / **LOW** queues; **daemon thread** runs **3 HIGH : 1 LOW** fair loop; **acks** Kafka only after `processQueuedJob` returns. |
-| **`JobProcessingService`** | Orchestrates: **try Redis lock** → **claim PENDING→RUNNING** → **execute** → **SUCCESS** or **failure path** (re-publish or FAILED). |
-| **`JobStateService`** | `@Transactional` DB updates: `tryClaimPending` (atomic update), `markSuccess`, `recordExecutionFailure` (increment `retryCount`, PENDING+requeue or FAILED). |
-| **`JobDistributedLockService`** | Redis `SET NX EX` + token; Lua unlock; skip if lock held. |
-| **`MockJobTaskExecutor`** | Simulates work: `EMAIL`, `REPORT`, `SLOW_JOB`, `FAILING_JOB`, generic. |
-| **`JobQueueKafkaProducer`** | Retry publish to **same** topic as `message.priority()`. |
-| **`Job` / mirror enums** | JPA `validate` against existing table; includes `priority`. |
-| **`JobRepository`** | `claimIfStatus` bulk update for PENDING→RUNNING by id. |
-| **`KafkaConsumerConfig`** | `priorityFairKafkaListenerContainerFactory`: concurrency **1**, **MANUAL** ack, **`syncCommits=false`** for cross-thread ack. |
-| **`WorkerKafkaTopicsProperties` / `WorkerProperties`** | Topic names, consumer group ids, lock TTL, max execution attempts. |
-
-### 2.3 `job-dashboard`
-
-| Piece | Responsibility |
-|-------|------------------|
-| **`services/api.js`** | Axios: `GET/POST /jobs`; optional `VITE_API_BASE_URL` or dev proxy. |
-| **`Dashboard.jsx`** | Polling **5s**, filters, summary counts, refresh button. |
-| **`JobForm` / `JobTable` / `Filters`** | Create + table + client-side filter. |
-| **`vite.config.js`** | `VITE_API_PROXY_TARGET` → proxy `/jobs`, `/api` to Spring. |
-
-### 2.4 Infrastructure
-
-| Component | Purpose |
-|-----------|---------|
-| **PostgreSQL** | Durable jobs; both apps use same DB name (`jobscheduler` by default). |
-| **Kafka + Zookeeper** (or KRaft elsewhere) | Log-backed queues; API may auto-create topics. |
-| **Redis** | Non-database coordination (locks). |
-
----
-
-## 3. Data model (`jobs` table)
+## 7. Data model (`jobs` table)
 
 | Field | Meaning |
 |-------|---------|
 | `id` | UUID primary key. |
 | `job_type` | Free-form string (e.g. `EMAIL`, `SLOW_JOB`). |
-| `payload` | JSON (jsonb) — arbitrary parameters for workers. |
+| `payload` | JSON — arbitrary parameters for workers. |
 | `status` | `PENDING`, `RUNNING`, `SUCCESS`, `FAILED`. |
-| `priority` | `HIGH` or `LOW` (default **LOW** for legacy rows). |
-| `retry_count` | Incremented on API retry and on worker terminal failure path. |
-| `created_at` / `updated_at` | Timestamps (UTC). |
+| `priority` | `HIGH` or `LOW` (default **LOW**). |
+| `retry_count` | Incremented on API retry and on worker failure path. |
+| `created_at` / `updated_at` | Timestamps. |
 
 ---
 
-## 4. End-to-end workflow: create job (Kafka path)
+## 8. Follow one request: `POST /jobs` (with exact file paths)
 
-### Step A — HTTP request
+Open these files in order while you read. The **bold** names are Java classes.
 
-1. Client **`POST /jobs`** with `jobType`, `payload`, optional `priority` (default **LOW**).
-2. **`JobController`** → **`JobService.submitJob`** (transaction starts).
+### Phase 1 — API (scheduler JVM)
 
-### Step B — Persist
+1. **HTTP** hits **`JobController.createJob`**  
+   `distributed-job-scheduler/src/main/java/com/distributedjob/scheduler/controller/JobController.java`  
+   → calls **`jobService.submitJob(request)`**.
 
-3. **`Job`** row inserted: `status=PENDING`, `priority` set, `retryCount=0`.
-4. **`ApplicationEventPublisher.publishEvent(new JobCreatedEvent(...))`** registered for **after commit**.
+2. **`JobService.submitJob`**  
+   `.../service/JobService.java`  
+   - Builds a **`Job`** entity (`PENDING`, priority from request or `LOW`).  
+   - **`jobRepository.save(job)`** → INSERT into Postgres.  
+   - **`eventPublisher.publishEvent(new JobCreatedEvent(...))`** — event is **queued** for after-commit.
 
-### Step C — After successful commit
+3. Transaction **commits** (Spring closes the `@Transactional` method successfully).
 
-5. **`JobCreatedKafkaPublisher.onJobQueuedForKafka`** runs (**AFTER_COMMIT** only).
-6. **`JobQueueKafkaProducer.sendJobQueued`** chooses topic:
-   - **HIGH** → `job-queue-high`
-   - **LOW** → `job-queue-low`
-7. Kafka broker stores the record; API returns **201** + **`JobResponse`** to the client.
+4. **`JobCreatedKafkaPublisher.onJobQueuedForKafka`**  
+   `.../kafka/JobCreatedKafkaPublisher.java`  
+   - Runs only **after commit** (`AFTER_COMMIT`).  
+   - Calls **`JobQueueKafkaProducer.sendJobQueued(...)`**.
 
-**Why AFTER_COMMIT:** If the transaction **rolls back**, no Kafka message is sent — avoids “signal without row.”
+5. **`JobQueueKafkaProducer`**  
+   `.../kafka/JobQueueKafkaProducer.java`  
+   - Serializes **`JobQueueMessage`** to JSON.  
+   - **`kafkaTemplate.send(highOrLowTopic, jobId, json)`** — record lands in Kafka.
 
-### Step D — Worker ingress
+6. **`JobController`** returns **`JobResponse`** → client gets **201** with job id and `PENDING`.
 
-8. **`FairPriorityJobIngress`**: one consumer group reads **high** topic, another reads **low** topic.
-9. Each message is placed in an internal **HIGH** or **LOW** `LinkedBlockingQueue` (payload + `Acknowledgment` not yet acked).
+### Phase 2 — Worker (worker JVM)
 
-### Step E — Fair dispatch thread
+7. **`FairPriorityJobIngress`** (listener on **high** or **low** topic)  
+   `job-worker/src/main/java/com/distributedjob/worker/kafka/FairPriorityJobIngress.java`  
+   - Kafka delivers a record → pushed to internal **queue** (ack **not** yet sent).  
+   - Dispatcher thread dequeues → parses JSON into **`JobQueueMessage`**.
 
-10. Loop: up to **3** messages from HIGH queue (short timeouts), then **1** from LOW; anti-starvation when HIGH empty.
-11. For each item: parse JSON → **`JobQueueMessage`**, call **`JobProcessingService.processQueuedJob`**.
-12. When processing finishes (success or handled failure path), **`acknowledgment.acknowledge()`** runs.
+8. **`JobProcessingService.processQueuedJob`**  
+   `.../service/JobProcessingService.java`  
+   - **`JobDistributedLockService.tryLock(jobId)`** — Redis `SET` if absent.  
+   - If lock fails → **return** (another worker may be handling it).  
+   - **`JobStateService.tryClaimPending`** — runs UPDATE … WHERE id = ? AND status = PENDING; if 0 rows updated, unlock and return (duplicate/stale message).  
+   - **`MockJobTaskExecutor.execute(job)`** — simulate work.  
+   - On success: **`JobStateService.markSuccess`**.  
+   - On failure: **`JobStateService.recordExecutionFailure`** — maybe **`JobQueueKafkaProducer`** sends another message (retry) or marks **`FAILED`**.  
+   - **`finally`**: Redis unlock.
 
-### Step F — Processing one message
+9. Back in **`FairPriorityJobIngress`**, after `processQueuedJob` returns → **`acknowledgment.acknowledge()`** — Kafka marks offset so the message is not redelivered under normal settings.
 
-13. **`JobDistributedLockService.tryLock(jobId)`** — Redis key `prefix + jobId`. If not acquired, **return** (another worker may own it).
-14. **`JobStateService.tryClaimPending`**: JPQL/SQL update `PENDING`→`RUNNING` for that id; if **0 rows**, release lock and exit (duplicate message or state drift).
-15. **`MockJobTaskExecutor.execute(job)`** — logs / sleep / throw per `jobType`.
-16. On success: **`markSuccess`** → `SUCCESS`.
-17. On exception: **`recordExecutionFailure`**:
-    - Increment **`retryCount`**.
-    - If **`retryCount < maxExecutionAttempts`**: set **`PENDING`**, **`JobQueueKafkaProducer`** republishes **same** `priority` topic.
-    - Else: **`FAILED`**.
-18. **`unlock`** Redis in **`finally`**.
+### Phase 3 — See the result
 
----
-
-## 5. Alternate workflow: REST worker (`WorkerJobController`)
-
-- **`POST /api/workers/jobs/claim-next`**: uses **`JobRepository.findPendingForClaim`** (HIGH first, FIFO) + pessimistic lock / skip-locked pattern, then sets **RUNNING** in service.
-- **`POST /api/workers/jobs/{id}/complete`**: sets **SUCCESS** or **FAILED** from **RUNNING**.
-
-**Note:** Mixing heavy **Kafka workers** and **REST claim** on the same job set can race; use one execution style per environment for predictable demos.
-
----
-
-## 6. API retry (`POST /jobs/{id}/retry`)
-
-1. Only if **`FAILED`**.
-2. **`PENDING`**, **`retryCount++`**, save.
-3. **`JobCreatedEvent`** again → **same** Kafka lane as stored **`priority`**.
+10. **`GET /jobs` or `/jobs/{id}`** again → **`JobController`** → **`JobService`** → **`JobRepository`** → row now **`SUCCESS`** (or **`FAILED`** / still **`RUNNING`** briefly).
 
 ---
 
-## 7. Configuration touchpoints (quick reference)
+## 9. Alternate workflow: REST worker (`WorkerJobController`)
+
+- **`POST /api/workers/jobs/claim-next`** → **`JobService.claimNextPendingJob`** → **`JobRepository.findPendingForClaim`** (HIGH first, then oldest) → status **`RUNNING`**.  
+- **`POST /api/workers/jobs/{id}/complete`** → **`JobService.completeJob`** → **`SUCCESS`** or **`FAILED`**.
+
+No Kafka in this path. **Do not** mix heavy Kafka consumption and REST claim on the **same** job set for demos — they can race.
+
+**Files:** `WorkerJobController.java`, `JobService.java`, `JobRepository.java` (scheduler).
+
+---
+
+## 10. API retry (`POST /jobs/{id}/retry`)
+
+1. Only if status is **`FAILED`**.  
+2. **`JobService.retryFailedJob`** sets **`PENDING`**, increments **`retryCount`**, saves.  
+3. Publishes **`JobCreatedEvent`** again → same after-commit path → Kafka message on the job’s **priority** topic.
+
+---
+
+## 11. Glossary
+
+| Term | One-line meaning |
+|------|------------------|
+| **Topic** | Named stream in Kafka; producers append records, consumers subscribe. |
+| **Consumer group** | Kafka balances partitions across consumers with the **same group id**; each partition is read by one consumer in the group at a time. |
+| **Partition** | Shard of a topic; ordering is guaranteed **within** a partition (per key helps stick one job id to one partition). |
+| **Ack (acknowledge)** | Consumer tells Kafka “this record is done” — influences whether Kafka will redeliver. |
+| **JPA / Hibernate** | Java ORM: **`@Entity`** classes map to SQL tables; **`Repository`** interfaces generate queries. |
+| **`ddl-auto: update`** | On startup, Hibernate aligns DB schema with entities (dev-friendly; not typical for prod migrations). |
+| **`ddl-auto: validate`** | Fail startup if schema does not match entities. |
+| **`@Transactional`** | Method runs inside a database transaction (commit or rollback together). |
+| **`TransactionalEventListener`** | Run code **after** commit (or rollback) so side effects match DB outcome. |
+| **Redis NX** | “Set this key only if it does not exist” — primitive for a simple lock. |
+| **TTL** | Key expires automatically — avoids deadlock if a JVM dies holding a lock. |
+
+---
+
+## 12. Configuration touchpoints (quick reference)
 
 | Concern | Where |
 |---------|--------|
@@ -227,22 +342,23 @@ flowchart TB
 
 ---
 
-## 8. Operational semantics (interview-style)
+## 13. Behaviour notes (limitations)
 
-- **At-least-once Kafka:** duplicates possible; **DB claim** + **Redis lock** mitigate double execution.
-- **Ordering:** Per-partition order only; **fair ingress** adds app-level priority between two topics.
-- **Durability:** Postgres survives broker/worker restarts; **stuck RUNNING** if a worker dies mid-flight is a known production follow-up (timeouts, reclaim).
-- **Idempotency:** Not fully generic; design assumes **one logical completion** per job id via state machine.
+- **At-least-once Kafka:** the same message can be delivered more than once; **DB claim** + **Redis lock** reduce double execution but do not magically make every integration idempotent.  
+- **Ordering:** only **per partition**, not globally across the whole topic.  
+- **Stuck `RUNNING`:** if a worker dies mid-job, the row can stay `RUNNING`; production systems add timeouts or reclaim logic.  
+- **Mock executor:** real systems swap in real I/O and idempotency keys.
 
 ---
 
-## 9. Related files in repo
+## 14. Related files in repo
 
 | Doc / script | Purpose |
 |--------------|---------|
-| [README.md](../README.md) | Runbook, diagrams, API tables, priority section |
-| [scripts/demo-burst-jobs.sh](../scripts/demo-burst-jobs.sh) | Burst `POST /jobs` for load demos |
+| [README.md](../README.md) | Runbook, API tables, troubleshooting |
+| [LEARNING_RESOURCES.md](./LEARNING_RESOURCES.md) | External tutorials and official manuals |
+| [scripts/demo-burst-jobs.sh](../scripts/demo-burst-jobs.sh) | Burst `POST /jobs` |
 
 ---
 
-*Last updated to match this repository (Spring Boot 3.2, Java 21 in scheduler POM where applicable, dual Kafka topics, fair worker ingress, Redis locks, optional React dashboard).*
+*Document matches this repository layout: Spring Boot 3, Java 21 in Maven POMs, dual Kafka topics, fair worker ingress, Redis locks, optional React dashboard.*

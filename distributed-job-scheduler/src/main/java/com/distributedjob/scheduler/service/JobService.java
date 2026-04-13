@@ -51,7 +51,12 @@ public class JobService {
         job.setPriority(priority);
         job.setRetryCount(0);
         Job saved = jobRepository.save(job);
-        log.info("Submitted {} priority job {} (type={})", priority, saved.getId(), saved.getJobType());
+        log.info(
+                "event=job_submitted jobId={} priority={} jobType={} retryCount={}",
+                saved.getId(),
+                priority,
+                saved.getJobType(),
+                saved.getRetryCount());
         eventPublisher.publishEvent(new JobCreatedEvent(saved.getId(), saved.getJobType(), saved.getPriority()));
         return toResponse(saved);
     }
@@ -80,8 +85,11 @@ public class JobService {
         job.setStatus(JobStatus.PENDING);
         job.setRetryCount(job.getRetryCount() + 1);
         Job saved = jobRepository.save(job);
-        log.info("API retry: re-queued {} priority job {} to Kafka (retryCount={})",
-                saved.getPriority(), saved.getId(), saved.getRetryCount());
+        log.info(
+                "event=job_retry_requested jobId={} priority={} retryCount={}",
+                saved.getId(),
+                saved.getPriority(),
+                saved.getRetryCount());
         eventPublisher.publishEvent(new JobCreatedEvent(saved.getId(), saved.getJobType(), saved.getPriority()));
         return toResponse(saved);
     }
@@ -98,7 +106,13 @@ public class JobService {
         }
         Job job = batch.get(0);
         job.setStatus(JobStatus.RUNNING);
-        return toResponse(jobRepository.save(job));
+        Job saved = jobRepository.save(job);
+        log.info(
+                "event=job_claimed_via_rest_worker jobId={} priority={} jobType={}",
+                saved.getId(),
+                saved.getPriority(),
+                saved.getJobType());
+        return toResponse(saved);
     }
 
     /**
@@ -115,7 +129,13 @@ public class JobService {
                         HttpStatus.NOT_FOUND,
                         "Running job not found for id: " + id));
         job.setStatus(outcome);
-        return toResponse(jobRepository.save(job));
+        Job saved = jobRepository.save(job);
+        log.info(
+                "event=job_completed_via_rest_worker jobId={} priority={} status={}",
+                saved.getId(),
+                saved.getPriority(),
+                saved.getStatus());
+        return toResponse(saved);
     }
 
     private JobResponse toResponse(Job job) {

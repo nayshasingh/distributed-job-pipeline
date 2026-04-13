@@ -1,5 +1,6 @@
 package com.distributedjob.worker.service;
 
+import com.distributedjob.worker.config.WorkerProperties;
 import com.distributedjob.worker.entity.Job;
 import com.distributedjob.worker.entity.JobStatus;
 import com.distributedjob.worker.kafka.JobQueueMessage;
@@ -9,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -18,9 +20,11 @@ public class JobStateService {
     private static final Logger log = LoggerFactory.getLogger(JobStateService.class);
 
     private final JobRepository jobRepository;
+    private final WorkerProperties workerProperties;
 
-    public JobStateService(JobRepository jobRepository) {
+    public JobStateService(JobRepository jobRepository, WorkerProperties workerProperties) {
         this.jobRepository = jobRepository;
+        this.workerProperties = workerProperties;
     }
 
     /**
@@ -30,6 +34,18 @@ public class JobStateService {
     @Transactional
     public Optional<Job> tryClaimPending(UUID jobId) {
         int updated = jobRepository.claimIfStatus(jobId, JobStatus.PENDING, JobStatus.RUNNING);
+        if (updated == 0) {
+            Instant staleBefore = Instant.now().minusSeconds(Math.max(1, workerProperties.staleRunningTimeoutSeconds()));
+            int reclaimed = jobRepository.reclaimStaleRunning(
+                    jobId,
+                    JobStatus.RUNNING,
+                    JobStatus.PENDING,
+                    staleBefore);
+            if (reclaimed > 0) {
+                log.warn("event=job_stale_running_reclaimed jobId={} staleBefore={}", jobId, staleBefore);
+                updated = jobRepository.claimIfStatus(jobId, JobStatus.PENDING, JobStatus.RUNNING);
+            }
+        }
         if (updated == 0) {
             return Optional.empty();
         }
@@ -61,15 +77,23 @@ public class JobStateService {
         if (job.getRetryCount() < limit) {
             job.setStatus(JobStatus.PENDING);
             jobRepository.save(job);
-            log.info("{} priority job {} Kafka retry scheduled (retryCount={}, maxAttempts={})",
-                    job.getPriority(), job.getId(), job.getRetryCount(), limit);
+            log.info(
+                    "event=job_retry_scheduled jobId={} priority={} retryCount={} maxAttempts={}",
+                    job.getId(),
+                    job.getPriority(),
+                    job.getRetryCount(),
+                    limit);
             return ExecutionFailureResult.requeue(
                     new JobQueueMessage(job.getId(), job.getJobType(), job.getPriority()));
         }
         job.setStatus(JobStatus.FAILED);
         jobRepository.save(job);
-        log.error("{} priority job {} terminal FAILED after {} execution attempts (retryCount={})",
-                job.getPriority(), job.getId(), limit, job.getRetryCount());
+        log.error(
+                "event=job_terminal_failed jobId={} priority={} maxAttempts={} retryCount={}",
+                job.getId(),
+                job.getPriority(),
+                limit,
+                job.getRetryCount());
         return ExecutionFailureResult.terminalFailed();
     }
 }
