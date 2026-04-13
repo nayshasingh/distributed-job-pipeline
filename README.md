@@ -1,86 +1,77 @@
-# Distributed Job Scheduler
+# Priority-aware async job pipeline
 
-A small **reference architecture** for background jobs in Java: a **Spring Boot API** persists jobs in **PostgreSQL**, publishes work to **Apache Kafka**, and one or more **worker** processes consume messages, coordinate with **Redis** distributed locks, update job status, and **re-publish** failed jobs for retry until a configurable limit.
+This project is built around a concrete backend problem: **urgent background work gets delayed when mixed with bulk work**.  
+Example: a user-facing notification and a large report generation request should not have equal scheduling behavior.
 
-This repository contains two Maven applications:
+Instead of a single queue with ad-hoc retries, this repo implements a small production-inspired pipeline:
 
-| Module | Directory | Role |
-|--------|-----------|------|
-| **API / scheduler** | [`distributed-job-scheduler/`](distributed-job-scheduler/) | REST API for creating and inspecting jobs; optional REST hooks for workers; Kafka producer to **`job-queue-high`** / **`job-queue-low`**. |
-| **Worker** | [`job-worker/`](job-worker/) | Dual-topic Kafka ingress with **fair 3:1** dispatch; PostgreSQL; Redis lock per `jobId`; mock execution; retry republish to the **same** priority topic. |
+- **Two priority lanes** (`HIGH`, `LOW`) with fair dispatch (**3:1**) so urgent work is preferred but low-priority work still progresses.
+- **Durable state in Postgres** (`jobs` table) as system of record.
+- **Kafka-based asynchronous execution** between API and worker.
+- **Redis execution locks** to reduce duplicate processing when messages are redelivered.
+- **Stale RUNNING recovery** to reclaim jobs left RUNNING after worker crashes.
+- **Structured lifecycle logs** (`event=... jobId=...`) to make incident debugging easier.
 
-For a **full component-by-component walkthrough** (flows, classes, config), see [docs/ARCHITECTURE_AND_WORKFLOW.md](docs/ARCHITECTURE_AND_WORKFLOW.md).
+**Stack:** Spring Boot 3 · Java 21 · PostgreSQL · Kafka · Redis · optional React (Vite) dashboard  
+**Deep dive:** [Architecture & workflow](docs/ARCHITECTURE_AND_WORKFLOW.md)  
+**Learning links:** [LEARNING_RESOURCES.md](docs/LEARNING_RESOURCES.md)
 
 ---
-## Why this project matters
 
-Modern backend systems cannot execute heavy tasks (emails, reports, payments)
-synchronously without impacting performance and scalability.
+## Problem statement
 
-This project demonstrates how real-world systems handle:
+When teams move synchronous work to background workers, three issues usually appear quickly:
 
-- Asynchronous job execution
-- Distributed task processing across multiple workers
-- Fault tolerance with retry mechanisms
-- Decoupling request handling from execution
+1. **Priority inversion** — critical jobs wait behind low-value bulk jobs.
+2. **Duplicate processing risk** — at-least-once messaging means the same job may be seen more than once.
+3. **Operational blind spots** — hard to explain why a job is stuck or retried.
 
-The architecture is similar to systems used in companies like:
-- email delivery pipelines
-- payment processing systems
-- data processing pipelines
+This repository focuses on those three issues with simple, explicit design choices.
 
-This project showcases core backend engineering concepts tested in SDE interviews:
-distributed systems, concurrency, fault tolerance, and scalability.
+| Service | Directory | Responsibility |
+|---------|-----------|----------------|
+| **Scheduler API** | [`distributed-job-scheduler/`](distributed-job-scheduler/) | `POST /jobs`, listing, Swagger; owns JPA schema; publishes to **`job-queue-high`** or **`job-queue-low`** after the DB transaction **commits**. |
+| **Worker** | [`job-worker/`](job-worker/) | Two consumer groups + in-process **3 HIGH : 1 LOW** fair merge; **Redis lock** per `jobId`; `PENDING → RUNNING → SUCCESS/FAILED`; failures **re-publish** to the same priority topic until a cap. |
+| **Dashboard** | [`job-dashboard/`](job-dashboard/) | React UI to watch job status (proxies to the API in dev). |
 
-## Key Engineering Highlights
+---
 
-- Built a distributed job processing system using Kafka and Redis
-- Implemented asynchronous task execution with producer-consumer architecture
-- Designed retry mechanisms with configurable failure handling
-- Used Redis-based distributed locking to prevent duplicate execution
-- Ensured durability using PostgreSQL as system of record
-- Scaled execution using multiple worker instances (horizontal scaling)
+## Engineering decisions and tradeoffs
 
-## What is this project for?
-
-This is a **learning and reference implementation**, not a production SaaS. It shows how to build a **distributed background-job pipeline** similar in spirit to systems that send emails, generate PDFs, or run heavy tasks **outside** the HTTP request:
-
-| Idea | What this repo demonstrates |
-|------|------------------------------|
-| **Decouple “accept work” from “do work”** | The API stores the job and returns quickly; **Kafka** carries a small “work available” signal to workers. |
-| **Scale workers horizontally** | Run **multiple** `job-worker` instances; **Redis locks** reduce the chance that two JVMs execute the **same** `jobId` at once. |
-| **Durable state** | **PostgreSQL** is the source of truth for status, payload, and retry counts. |
-| **Failure handling** | Failed runs can be **re-queued via Kafka** (with a cap) instead of only failing in memory. |
-| **Patterns you can copy** | Spring Boot 3, JPA, Kafka producer/consumer, transactional outbox-style “publish after commit”, optional REST-based workers. |
-
-**Typical uses for you:**
-
-- **Understand** how job queues, consumers, and idempotency-ish patterns fit together in Java.
-- **Template** for a real system: replace `MockJobTaskExecutor` with real integrations (email, webhooks, batch reports).
-- **Interview / portfolio** piece that you can run locally with Docker and explain end-to-end.
-
-It does **not** ship production hardening (auth, metrics dashboards, dead-letter topics, job scheduling by time, or a full outbox table). Treat it as a **starting point**.
+- **Priority via separate Kafka topics (`job-queue-high`, `job-queue-low`)**  
+  Chosen for clarity and isolation of backlogs. Tradeoff: extra consumer/topic configuration.
+- **Fair worker scheduling (3 HIGH : 1 LOW)**  
+  Prevents LOW starvation while still favoring urgent jobs. Tradeoff: not strict latency guarantees.
+- **Publish-to-Kafka after DB commit (`@TransactionalEventListener`)**  
+  Avoids messaging jobs that never committed. Tradeoff: still not a full outbox table pattern.
+- **DB claim + Redis lock together**  
+  DB state machine remains source of truth; Redis reduces duplicate execution windows. Tradeoff: more moving parts than DB-only coordination.
+- **Reclaim stale `RUNNING` jobs**  
+  Worker can recover jobs stuck in RUNNING beyond a timeout (`JOB_WORKER_STALE_RUNNING_TIMEOUT_SECONDS`). Tradeoff: timeout must be tuned to avoid reclaiming genuinely long jobs.
+- **Structured logging for lifecycle events**  
+  `event=... jobId=... priority=...` logs improve troubleshooting and demo explainability. Tradeoff: requires log discipline.
 
 ---
 
 ## Table of contents
 
-1. [What is this project for?](#what-is-this-project-for)  
-2. [How to verify everything works](#how-to-verify-everything-works)  
-3. [Architecture overview](#architecture-overview)  
-4. [System context diagram](#system-context-diagram)  
-5. [Job lifecycle and state machine](#job-lifecycle-and-state-machine)  
-6. [End-to-end workflows](#end-to-end-workflows)  
-7. [REST API reference](#rest-api-reference)  
-8. [Kafka message format](#kafka-message-format)  
-9. [Priority-based Job Scheduling](#priority-based-job-scheduling)  
-10. [Distributed locking (Redis)](#distributed-locking-redis)  
-11. [Configuration and environment variables](#configuration-and-environment-variables)  
-12. [Prerequisites](#prerequisites)  
-13. [How to run](#how-to-run)  
-14. [Project structure](#project-structure)  
-15. [Design notes and limitations](#design-notes-and-limitations)  
-16. [Troubleshooting](#troubleshooting)  
+1. [Problem statement](#problem-statement)  
+2. [Engineering decisions and tradeoffs](#engineering-decisions-and-tradeoffs)  
+3. [How to verify everything works](#how-to-verify-everything-works)  
+4. [Architecture overview](#architecture-overview)  
+5. [System context diagram](#system-context-diagram)  
+6. [Job lifecycle and state machine](#job-lifecycle-and-state-machine)  
+7. [End-to-end workflows](#end-to-end-workflows)  
+8. [REST API reference](#rest-api-reference)  
+9. [Kafka message format](#kafka-message-format)  
+10. [Priority-based Job Scheduling](#priority-based-job-scheduling)  
+11. [Distributed locking (Redis)](#distributed-locking-redis)  
+12. [Configuration and environment variables](#configuration-and-environment-variables)  
+13. [Prerequisites](#prerequisites)  
+14. [How to run](#how-to-run)  
+15. [Project structure](#project-structure)  
+16. [Design notes and limitations](#design-notes-and-limitations)  
+17. [Troubleshooting](#troubleshooting)  
 
 ---
 
@@ -178,12 +169,12 @@ stateDiagram-v2
   RUNNING --> SUCCESS: Task succeeds
   RUNNING --> PENDING: Task fails,\nretryCount < max attempts\n(re-publish Kafka)
   RUNNING --> FAILED: Task fails,\nretryCount reached max\n(or API retry from FAILED)
-  FAILED --> PENDING: POST /jobs/id/retry\n(API only; no Kafka from API today)
+  FAILED --> PENDING: POST /jobs/id/retry\n(re-publish to Kafka)
   SUCCESS --> [*]
   FAILED --> [*]
 ```
 
-**Note:** The API’s `POST /jobs/{id}/retry` moves a **FAILED** job back to **PENDING** and increments `retryCount`; it does **not** automatically publish to Kafka in the current code. Workers driven purely by Kafka will only see that job again if something else publishes a message or you extend the API.
+**Note:** `POST /jobs/{id}/retry` is only valid for **FAILED** jobs: the row goes back to **PENDING**, **`retryCount`** increments, and the same **`JobCreatedEvent`** path runs **after commit**, so a new message lands on the correct **HIGH/LOW** topic.
 
 ---
 
@@ -371,7 +362,7 @@ See class-level documentation in
 
 ## Prerequisites
 
-- **Java 17**
+- **Java 21** (matches both Maven modules’ `pom.xml`)
 - **Maven 3.8+**
 - **Docker** (optional but recommended) — for [`docker-compose.yml`](docker-compose.yml)
 - Or install locally: **PostgreSQL 14+**, **Apache Kafka** (or compatible), **Redis 6+**
@@ -588,10 +579,10 @@ If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5
 
 ## Design notes and limitations
 
-- **Outbox pattern:** Kafka send runs **after commit** via a transactional application event listener, reducing the risk of “message without row” when the DB rolls back.
-- **At-least-once Kafka:** Duplicate delivery is possible; **DB claim** (`PENDING` → `RUNNING`) and **Redis locks** reduce duplicate execution.
-- **API retry:** `POST /jobs/{id}/retry` moves the job to **PENDING** and **re-publishes** to the correct priority topic (same as initial create).
-- **Stuck RUNNING:** If a worker dies mid-execution without updating the row, a job can remain **RUNNING**; production systems add **timeouts**, **heartbeats**, or **reclaim** jobs.
+- **Publish after commit:** Kafka send runs **after commit** via `TransactionalEventListener`. I did not build a separate outbox table; I know that is another pattern people use when they need stronger guarantees.
+- **Kafka redelivery:** Messages can show up more than once; the worker uses a **DB state change** and a **Redis lock** to lower duplicate work, but I would not call this a full “exactly-once” story without more reading on my side.
+- **API retry:** `POST /jobs/{id}/retry` moves the job to **PENDING** and **re-publishes** to the correct priority topic (same path as create).
+- **Stuck RUNNING:** This repo now includes timeout-based reclaim for stale `RUNNING` jobs. Production systems typically add heartbeats and dedicated recovery/sweeper logic too.
 - **Mock executor:** Real integrations would replace [`MockJobTaskExecutor`](job-worker/src/main/java/com/distributedjob/worker/service/MockJobTaskExecutor.java) with calls to email providers, report engines, etc.
 - **Security:** No authentication on REST endpoints; add Spring Security for real deployments.
 
@@ -609,14 +600,9 @@ If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5
 
 ---
 
-## Real-world use cases
+## Why people use stacks like this
 
-This architecture is commonly used in:
-
-- E-commerce: order processing, notifications
-- Fintech: payment processing pipelines
-- SaaS platforms: report generation, background jobs
-- Social media: feed generation, notifications
+From what I have read, similar ideas show up wherever work is **too slow for the HTTP request** — emails, reports, payments post-processing, and so on. I am using this project to get comfortable with the moving parts, not to say I have solved all the hard distributed-systems problems.
 
 ## License
 

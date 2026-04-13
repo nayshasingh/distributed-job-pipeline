@@ -49,6 +49,8 @@ app:
   worker:
     # Total execution attempts (first consume + Kafka re-publishes). Default 4 = initial run + up to 3 retries.
     max-execution-attempts: ${JOB_WORKER_MAX_EXECUTION_ATTEMPTS:4}
+    # Reclaim a RUNNING job if it has not been updated for this long (worker crash recovery).
+    stale-running-timeout-seconds: ${JOB_WORKER_STALE_RUNNING_TIMEOUT_SECONDS:900}
     # Redis lock key = prefix + jobId. TTL bounds how long a crashed worker can block others.
     distributed-lock-key-prefix: ${JOB_WORKER_LOCK_KEY_PREFIX:job-worker:exec:}
     distributed-lock-ttl-seconds: ${JOB_WORKER_LOCK_TTL_SECONDS:600}
