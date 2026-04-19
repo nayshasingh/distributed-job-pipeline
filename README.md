@@ -603,7 +603,3 @@ If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5
 ## Why people use stacks like this
 
 From what I have read, similar ideas show up wherever work is **too slow for the HTTP request** — emails, reports, payments post-processing, and so on. I am using this project to get comfortable with the moving parts, not to say I have solved all the hard distributed-systems problems.
-
-## License
-
-No license file is included in this demo repository; add one (e.g. MIT, Apache-2.0) if you publish or distribute the code.
