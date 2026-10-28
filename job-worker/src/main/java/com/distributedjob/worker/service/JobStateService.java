@@ -11,6 +11,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -50,6 +52,29 @@ public class JobStateService {
             return Optional.empty();
         }
         return jobRepository.findById(jobId);
+    }
+
+    /**
+     * Finds RUNNING jobs that have not been updated within the stale timeout, moves them back to
+     * PENDING, and returns the rows that this worker successfully reclaimed.
+     */
+    @Transactional
+    public List<Job> reclaimStaleRunningJobs() {
+        Instant staleBefore = Instant.now().minusSeconds(Math.max(1, workerProperties.staleRunningTimeoutSeconds()));
+        List<Job> candidates = jobRepository.findStaleRunning(JobStatus.RUNNING, staleBefore);
+        List<Job> reclaimed = new ArrayList<>();
+        for (Job candidate : candidates) {
+            int updated = jobRepository.reclaimStaleRunning(
+                    candidate.getId(),
+                    JobStatus.RUNNING,
+                    JobStatus.PENDING,
+                    staleBefore);
+            if (updated > 0) {
+                log.warn("event=job_stale_running_reclaimed jobId={} staleBefore={}", candidate.getId(), staleBefore);
+                jobRepository.findById(candidate.getId()).ifPresent(reclaimed::add);
+            }
+        }
+        return reclaimed;
     }
 
     @Transactional

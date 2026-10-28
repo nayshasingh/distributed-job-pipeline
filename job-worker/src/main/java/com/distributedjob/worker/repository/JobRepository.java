@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 public interface JobRepository extends JpaRepository<Job, UUID> {
@@ -27,5 +28,10 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
             @Param("id") UUID id,
             @Param("runningStatus") JobStatus runningStatus,
             @Param("pendingStatus") JobStatus pendingStatus,
+            @Param("staleBefore") Instant staleBefore);
+
+    @Query("select j from Job j where j.status = :runningStatus and j.updatedAt < :staleBefore")
+    List<Job> findStaleRunning(
+            @Param("runningStatus") JobStatus runningStatus,
             @Param("staleBefore") Instant staleBefore);
 }

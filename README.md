@@ -174,7 +174,7 @@ stateDiagram-v2
   FAILED --> [*]
 ```
 
-**Note:** `POST /jobs/{id}/retry` is only valid for **FAILED** jobs: the row goes back to **PENDING**, **`retryCount`** increments, and the same **`JobCreatedEvent`** path runs **after commit**, so a new message lands on the correct **HIGH/LOW** topic.
+**Note:** `POST /jobs/{id}/retry` is only valid for **FAILED** jobs: the row goes back to **PENDING**, **`retryCount` is reset to 0** so the worker gets a fresh attempt budget, and the same **`JobCreatedEvent`** path runs **after commit**, so a new message lands on the correct **HIGH/LOW** topic.
 
 ---
 
@@ -242,7 +242,7 @@ You can **Try it out** on each endpoint the same way you would in Postman. The *
 | `POST` | `/jobs` | Create a job. Body: `{ "jobType": string, "payload": JSON, "priority"?: "HIGH" \| "LOW" }`. **`priority`** optional; defaults to **LOW**. Returns **201** + job. Publishes to **high** or **low** Kafka topic after DB commit. |
 | `GET` | `/jobs` | List all jobs (newest first by `createdAt`). |
 | `GET` | `/jobs/{id}` | Job details. **404** if missing. |
-| `POST` | `/jobs/{id}/retry` | Only if status is **FAILED**: set **PENDING**, increment `retryCount`, **re-publish to Kafka** on the job’s **same** priority topic. **400** if not failed. |
+| `POST` | `/jobs/{id}/retry` | Only if status is **FAILED**: set **PENDING**, reset `retryCount` to **0**, **re-publish to Kafka** on the job’s **same** priority topic. **400** if not failed. |
 
 **Validation (`POST /jobs`):**
 
@@ -354,6 +354,8 @@ See class-level documentation in
 | `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis for locks |
 | `REDIS_PASSWORD` | empty | Optional auth |
 | `JOB_WORKER_MAX_EXECUTION_ATTEMPTS` | `4` | Total failed **executions** before **FAILED** (default ≈ 1 initial + 3 Kafka retries) |
+| `JOB_WORKER_STALE_RUNNING_TIMEOUT_SECONDS` | `900` | A `RUNNING` row older than this can be reclaimed |
+| `JOB_WORKER_STALE_RECLAIM_INTERVAL_MS` | `30000` | How often the worker scans for stale `RUNNING` jobs |
 | `JOB_WORKER_LOCK_KEY_PREFIX` | `job-worker:exec:` | Redis key prefix |
 | `JOB_WORKER_LOCK_TTL_SECONDS` | `600` | Lock TTL (seconds) |
 | `spring.jpa.hibernate.ddl-auto` | `validate` | Expect existing schema |
@@ -541,6 +543,17 @@ With the **worker terminal** visible:
 | End-to-end | `EMAIL` / `REPORT` jobs reach **SUCCESS** in the API. |
 | Retries | `FAILING_JOB` ends **FAILED** with **retryCount** at least **1** after several tries. |
 
+### 6. Unit tests
+
+From each Maven module (needs Java 21):
+
+```bash
+cd distributed-job-scheduler && mvn test
+cd ../job-worker && mvn test
+```
+
+**Expect:** tests pass for job submit/retry, DB claim + retry cap, Redis lock skip, Kafka ack policy, and stale-job re-publish.
+
 If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5432**, **9092**, **6379** match your `docker compose` and env vars.
 
 ---
@@ -581,8 +594,8 @@ If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5
 
 - **Publish after commit:** Kafka send runs **after commit** via `TransactionalEventListener`. I did not build a separate outbox table; I know that is another pattern people use when they need stronger guarantees.
 - **Kafka redelivery:** Messages can show up more than once; the worker uses a **DB state change** and a **Redis lock** to lower duplicate work, but I would not call this a full “exactly-once” story without more reading on my side.
-- **API retry:** `POST /jobs/{id}/retry` moves the job to **PENDING** and **re-publishes** to the correct priority topic (same path as create).
-- **Stuck RUNNING:** This repo now includes timeout-based reclaim for stale `RUNNING` jobs. Production systems typically add heartbeats and dedicated recovery/sweeper logic too.
+- **API retry:** `POST /jobs/{id}/retry` moves the job to **PENDING**, **resets `retryCount`**, and **re-publishes** to the correct priority topic (same path as create).
+- **Stuck RUNNING:** Workers reclaim rows that stay `RUNNING` past `JOB_WORKER_STALE_RUNNING_TIMEOUT_SECONDS` both on the next Kafka delivery and on a scheduled sweeper that re-publishes to Kafka. Heartbeats would still be stronger in production.
 - **Mock executor:** Real integrations would replace [`MockJobTaskExecutor`](job-worker/src/main/java/com/distributedjob/worker/service/MockJobTaskExecutor.java) with calls to email providers, report engines, etc.
 - **Security:** No authentication on REST endpoints; add Spring Security for real deployments.
 

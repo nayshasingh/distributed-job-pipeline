@@ -84,11 +84,13 @@ Root: `job-worker/src/main/java/com/distributedjob/worker/`
 | Path (under `worker/`) | What it does |
 |------------------------|--------------|
 | **`JobWorkerApplication.java`** | `main()` — starts Spring Boot; enables Kafka listeners. |
-| **`kafka/FairPriorityJobIngress.java`** | **Heart of consumption:** two **`@KafkaListener`** methods (one topic + consumer group per priority lane). Each puts work on an internal **queue**; a **background thread** takes jobs in a **3 HIGH : 1 LOW** pattern and calls `JobProcessingService`. Kafka **ack** happens only after processing returns. |
-| **`kafka/JobQueueKafkaProducer.java`** | On retry, sends another message to the **same** high/low topic as the job’s priority. |
+| **`kafka/FairPriorityJobIngress.java`** | **Heart of consumption:** two **`@KafkaListener`** methods (one topic + consumer group per priority lane). Each puts work on an internal **queue**; a **background thread** takes jobs in a **3 HIGH : 1 LOW** pattern and calls `QueuedJobDelivery`. |
+| **`kafka/QueuedJobDelivery.java`** | Parses the payload, runs `JobProcessingService`, **acks** on success or poison JSON, **does not ack** unexpected errors. |
+| **`kafka/JobQueueKafkaProducer.java`** | On retry or stale reclaim, sends another message to the **same** high/low topic as the job’s priority. |
 | **`kafka/JobQueueMessage.java`** | Same JSON shape as scheduler (parsed from consumer record). |
 | **`service/JobProcessingService.java`** | **`processQueuedJob`**: try **Redis lock** → **`JobStateService.tryClaimPending`** → **`MockJobTaskExecutor.execute`** → success or **`recordExecutionFailure`** (maybe re-publish to Kafka). **`finally`**: release Redis lock. |
-| **`service/JobStateService.java`** | All **`@Transactional`** updates to the `jobs` row: claim PENDING→RUNNING, set SUCCESS, or handle failure + retry count. |
+| **`service/JobStateService.java`** | All **`@Transactional`** updates to the `jobs` row: claim PENDING→RUNNING, set SUCCESS, handle failure + retry count, reclaim stale RUNNING. |
+| **`service/StaleRunningJobRecovery.java`** | Scheduled sweeper: finds stale `RUNNING` jobs, sets them `PENDING`, re-publishes to Kafka. |
 | **`service/JobDistributedLockService.java`** | Talks to Redis: **`SET` key with NX + expiry**, unlock with Lua script + token. |
 | **`service/MockJobTaskExecutor.java`** | Fake work: log, sleep for `SLOW_JOB`, throw for `FAILING_JOB`, etc. Replace with real integrations in a real system. |
 | **`service/ExecutionFailureResult.java`** | Small type used when deciding “requeue vs FAILED.” |
@@ -281,7 +283,7 @@ Open these files in order while you read. The **bold** names are Java classes.
    - On failure: **`JobStateService.recordExecutionFailure`** — maybe **`JobQueueKafkaProducer`** sends another message (retry) or marks **`FAILED`**.  
    - **`finally`**: Redis unlock.
 
-9. Back in **`FairPriorityJobIngress`**, after `processQueuedJob` returns → **`acknowledgment.acknowledge()`** — Kafka marks offset so the message is not redelivered under normal settings.
+9. Back in **`QueuedJobDelivery`**, after `processQueuedJob` returns → **`acknowledgment.acknowledge()`**. Poison JSON is also acked. Unexpected errors are left unacked so Kafka can redeliver.
 
 ### Phase 3 — See the result
 
@@ -303,7 +305,7 @@ No Kafka in this path. **Do not** mix heavy Kafka consumption and REST claim on 
 ## 10. API retry (`POST /jobs/{id}/retry`)
 
 1. Only if status is **`FAILED`**.  
-2. **`JobService.retryFailedJob`** sets **`PENDING`**, increments **`retryCount`**, saves.  
+2. **`JobService.retryFailedJob`** sets **`PENDING`**, resets **`retryCount` to 0**, saves.  
 3. Publishes **`JobCreatedEvent`** again → same after-commit path → Kafka message on the job’s **priority** topic.
 
 ---
@@ -346,7 +348,7 @@ No Kafka in this path. **Do not** mix heavy Kafka consumption and REST claim on 
 
 - **At-least-once Kafka:** the same message can be delivered more than once; **DB claim** + **Redis lock** reduce double execution but do not magically make every integration idempotent.  
 - **Ordering:** only **per partition**, not globally across the whole topic.  
-- **Stuck `RUNNING`:** if a worker dies mid-job, the row can stay `RUNNING`; production systems add timeouts or reclaim logic.  
+- **Stuck `RUNNING`:** a worker crash can leave a row `RUNNING`. This repo reclaims those rows after a timeout, both on the next Kafka delivery for that id and via a scheduled sweeper that re-publishes to Kafka. Production systems often add heartbeats too.  
 - **Mock executor:** real systems swap in real I/O and idempotency keys.
 
 ---

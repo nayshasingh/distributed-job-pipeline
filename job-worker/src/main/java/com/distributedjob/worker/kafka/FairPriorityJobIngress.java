@@ -1,8 +1,6 @@
 package com.distributedjob.worker.kafka;
 
 import com.distributedjob.worker.entity.JobPriority;
-import com.distributedjob.worker.service.JobProcessingService;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -22,9 +20,8 @@ import java.util.concurrent.TimeUnit;
  * {@code job-worker-low}) because a single Kafka consumer group must share the same subscription;
  * splitting groups per lane is the standard way to subscribe to different topics in parallel.
  *
- * <p>Messages are only <b>acknowledged after</b> {@link JobProcessingService#processQueuedJob(JobQueueMessage)}
- * finishes, preserving at-least-once semantics relative to processing (see {@code syncCommits} on the
- * listener container).
+ * <p>Messages are acknowledged by {@link QueuedJobDelivery} after processing succeeds (or after a
+ * poison payload). Unexpected errors are left unacked. See {@code syncCommits} on the listener container.
  *
  * <p><b>Fairness:</b> Each cycle we drain up to {@link #HIGH_BATCH_SIZE} messages from the HIGH lane
  * (waiting briefly per slot). Then we take at most one message from the LOW lane. If the HIGH lane is
@@ -41,15 +38,13 @@ public class FairPriorityJobIngress {
 
     private final LinkedBlockingQueue<PendingKafkaWork> highLane = new LinkedBlockingQueue<>();
     private final LinkedBlockingQueue<PendingKafkaWork> lowLane = new LinkedBlockingQueue<>();
-    private final ObjectMapper objectMapper;
-    private final JobProcessingService jobProcessingService;
+    private final QueuedJobDelivery queuedJobDelivery;
 
     private volatile boolean running = true;
     private Thread dispatcherThread;
 
-    public FairPriorityJobIngress(ObjectMapper objectMapper, JobProcessingService jobProcessingService) {
-        this.objectMapper = objectMapper;
-        this.jobProcessingService = jobProcessingService;
+    public FairPriorityJobIngress(QueuedJobDelivery queuedJobDelivery) {
+        this.queuedJobDelivery = queuedJobDelivery;
     }
 
     private record PendingKafkaWork(String payload, Acknowledgment ack, JobPriority lane) {
@@ -146,15 +141,6 @@ public class FairPriorityJobIngress {
     }
 
     private void deliver(PendingKafkaWork w) {
-        try {
-            JobQueueMessage message = objectMapper.readValue(w.payload(), JobQueueMessage.class);
-            log.info("Dequeuing {} priority job {} (type={}) from Kafka {} lane for execution",
-                    message.priority(), message.jobId(), message.jobType(), w.lane());
-            jobProcessingService.processQueuedJob(message);
-        } catch (Exception e) {
-            log.error("Failed to process Kafka payload from {} lane", w.lane(), e);
-        } finally {
-            w.ack().acknowledge();
-        }
+        queuedJobDelivery.deliver(w.payload(), w.ack(), w.lane());
     }
 }
