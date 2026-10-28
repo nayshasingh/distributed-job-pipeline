@@ -83,7 +83,9 @@ public class JobService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Only FAILED jobs can be retried");
         }
         job.setStatus(JobStatus.PENDING);
-        job.setRetryCount(job.getRetryCount() + 1);
+        // Operator retry starts a new execution budget. Worker retries still increment retryCount
+        // until max-execution-attempts; without a reset, a FAILED job would fail again on the next error.
+        job.setRetryCount(0);
         Job saved = jobRepository.save(job);
         log.info(
                 "event=job_retry_requested jobId={} priority={} retryCount={}",
