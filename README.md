@@ -334,7 +334,7 @@ See class-level documentation in
 | Variable / property | Default | Purpose |
 |---------------------|---------|---------|
 | `server.port` | `8080` | HTTP port |
-| `DB_USERNAME` / `DB_PASSWORD` | `postgres` / `postgres` | PostgreSQL credentials |
+| `DB_USERNAME` / `DB_PASSWORD` | `postgres` / `123` | PostgreSQL credentials |
 | JDBC URL | `jdbc:postgresql://localhost:5432/jobscheduler` | Database |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka brokers |
 | `KAFKA_JOB_QUEUE_HIGH_TOPIC` | `job-queue-high` | HIGH priority producer topic |
