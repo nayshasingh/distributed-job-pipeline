@@ -15,9 +15,9 @@ spring:
         enable.idempotence: true
         linger.ms: 5
   datasource:
-    url: jdbc:postgresql://localhost:5432/jobscheduler
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/jobscheduler}
     username: ${DB_USERNAME:postgres}
-    password: ${DB_PASSWORD:postgres}
+    password: ${DB_PASSWORD:123}
     driver-class-name: org.postgresql.Driver
   jpa:
     hibernate:
