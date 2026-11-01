@@ -447,9 +447,27 @@ docker compose exec postgres psql -U postgres -d jobscheduler -c \
 | **While draining** | One worker cleared the backlog at about **4 jobs/s**. Kafka/Postgres `PENDING` fell steadily (no stuck `RUNNING` pile-up). |
 | **After drain** | **5,030 SUCCESS**, **1 FAILED**, **0 PENDING**. By priority: HIGH **1,283** SUCCESS, LOW **3,747** SUCCESS + **1** FAILED. |
 
-**What this shows:** submit and execute are decoupled. The HTTP API absorbed 50 jobs/s without errors while a single worker ran at ~4 completions/s. The backlog lived in Kafka + Postgres, then drained to terminal SUCCESS. It does **not** show 5,000 concurrent clients, multi-node workers, or “zero duplication under cluster load.”
+**What this shows:** submit and execute are decoupled. The HTTP API absorbed 50 jobs/s without errors while a single worker ran at ~4 completions/s. The backlog lived in Kafka + Postgres, then drained to terminal SUCCESS. It does **not** show 5,000 concurrent clients or “zero duplication under cluster load.”
 
-**Reproduce:** same commands as above, then re-query Postgres until `PENDING` is 0 before you quote completion counts.
+### Same burst, two workers on one laptop
+
+A second `job-worker` (`SERVER_PORT=8082`) joined while that backlog was still draining. Prometheus scraped both processes. Together they accounted for every k6 submit (`jobs_submitted_total` HIGH 1,272 + LOW 3,730 = **5,002**).
+
+| Worker | HIGH SUCCESS | LOW SUCCESS | Total | Mean mock-exec time |
+|--------|-------------:|------------:|------:|---------------------|
+| `:8081` | 448 | 1,206 | **1,654** (33%) | HIGH 2.4ms / LOW 3.1ms |
+| `:8082` | 824 | 2,524 | **3,348** (67%) | HIGH 2.2ms / LOW 3.1ms |
+| **Both** | **1,272** | **3,730** | **5,002** | — |
+
+| Also measured | Value |
+|---------------|--------|
+| `jobs_lock_skipped_total` | **no samples** (no Redis lock skip on this run) |
+| Postgres after drain | **5,030 SUCCESS**, **1 FAILED**, **0 PENDING** (the extra ~29 SUCCESS + 1 FAILED are older manual rows, not this k6 script) |
+| Duplicate `SUCCESS` rows | **none** — one row per `jobId`; two processes split work, they did not double-complete |
+
+The 33/67 split is expected: the workers were **not** started together, so `:8082` took more of the remaining queue. This is two processes on one host, not a 2-node cluster. Mean exec time is the mock `EMAIL` handler (log + return), not real I/O.
+
+**Reproduce:** start two workers (`8081` and `8082`), run k6, then compare `jobs_completed_total` per instance in Prometheus. Re-query Postgres until `PENDING` is 0 before quoting completion counts.
 
 ---
 
