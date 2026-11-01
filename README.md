@@ -436,6 +436,19 @@ docker compose exec postgres psql -U postgres -d jobscheduler -c \
   "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY 1;"
 ```
 
+### What we did, and what happened
+
+k6 only calls the API. It does **not** wait for a worker to finish the job.
+
+1. Compose was up (Postgres, Kafka, Redis, Prometheus, Grafana).
+2. Scheduler on `:8080` and **both** workers (`:8081`, `:8082`) were already running.
+3. `k6 run load-tests/submit-jobs.js` sent **5,001** `POST /jobs` over **100 seconds** at **50/s**. Each job was `EMAIL` (mock: log and succeed). About **20** k6 VUs — not 5,000 concurrent clients.
+4. For each request the API wrote `PENDING` in Postgres and published to `job-queue-high` or `job-queue-low`. k6 counted a success on **HTTP 201**.
+5. Workers pulled Kafka, took a Redis lock, set `SUCCESS`. They could not match 50 accepts/s, so tickets piled up.
+6. When k6 stopped: **2,438 SUCCESS**, **2,592 PENDING**, **1 FAILED** (old `FAILING_JOB`, not this script).
+7. Workers kept going at about **4 completions/s** until `PENDING` was **0**.
+8. Final: **5,030 SUCCESS**, **1 FAILED**, **0 PENDING**. k6 created 5,001 rows; the extra ~30 SUCCESS are older manual jobs.
+
 ### Measured result (1 Nov 2026, one laptop, two workers)
 
 **Setup:** Docker Compose (Postgres 16, Kafka 7.5, Redis 7) on a MacBook; scheduler plus **two** `job-worker` JVMs (`:8081` and `:8082`) running before k6 started; `constant-arrival-rate` 50/s for 100s; job type `EMAIL` (mock executor returns immediately). About 30 rows already existed from earlier manual tests, including one `FAILING_JOB`. Each priority topic has **3 partitions**; both workers share consumer groups `job-worker-high` and `job-worker-low`.
