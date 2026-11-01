@@ -436,22 +436,11 @@ docker compose exec postgres psql -U postgres -d jobscheduler -c \
   "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY 1;"
 ```
 
-### What we did, and what happened
+k6 measures HTTP accept only (`201` on `POST /jobs`). Completion is a later `SUCCESS` update on the `jobs` row after Kafka consume, Redis lock, and the mock executor.
 
-k6 only calls the API. It does **not** wait for a worker to finish the job.
+### Result (1 Nov 2026 — local Compose, two workers)
 
-1. Compose was up (Postgres, Kafka, Redis, Prometheus, Grafana).
-2. Scheduler on `:8080` and **both** workers (`:8081`, `:8082`) were already running.
-3. `k6 run load-tests/submit-jobs.js` sent **5,001** `POST /jobs` over **100 seconds** at **50/s**. Each job was `EMAIL` (mock: log and succeed). About **20** k6 VUs — not 5,000 concurrent clients.
-4. For each request the API wrote `PENDING` in Postgres and published to `job-queue-high` or `job-queue-low`. k6 counted a success on **HTTP 201**.
-5. Workers pulled Kafka, took a Redis lock, set `SUCCESS`. They could not match 50 accepts/s, so tickets piled up.
-6. When k6 stopped: **2,438 SUCCESS**, **2,592 PENDING**, **1 FAILED** (old `FAILING_JOB`, not this script).
-7. Workers kept going at about **4 completions/s** until `PENDING` was **0**.
-8. Final: **5,030 SUCCESS**, **1 FAILED**, **0 PENDING**. k6 created 5,001 rows; the extra ~30 SUCCESS are older manual jobs.
-
-### Measured result (1 Nov 2026, one laptop, two workers)
-
-**Setup:** Docker Compose (Postgres 16, Kafka 7.5, Redis 7) on a MacBook; scheduler plus **two** `job-worker` JVMs (`:8081` and `:8082`) running before k6 started; `constant-arrival-rate` 50/s for 100s; job type `EMAIL` (mock executor returns immediately). About 30 rows already existed from earlier manual tests, including one `FAILING_JOB`. Each priority topic has **3 partitions**; both workers share consumer groups `job-worker-high` and `job-worker-low`.
+Docker Compose (Postgres 16, Kafka 7.5, Redis 7); scheduler `:8080`; workers `:8081` and `:8082` started before k6; `EMAIL` mock executor; ~30 pre-existing rows including one `FAILING_JOB`. Topics `job-queue-high` / `job-queue-low` each have **3 partitions**; both workers use groups `job-worker-high` and `job-worker-low`.
 
 | Stage | What we measured |
 |-------|------------------|
@@ -474,11 +463,11 @@ Prometheus `jobs_completed_total` on the two processes summed to every k6 submit
 | Extra Postgres rows | ~29 older SUCCESS + 1 FAILED, not from this k6 script |
 | Duplicate `SUCCESS` rows | **none** — one row per `jobId` |
 
-**Why 33/67, not 50/50:** Kafka assigns **whole partitions**. Three partitions and two consumers in a group typically become **2 + 1**. Completions track that: HIGH 448 vs 824 and LOW 1,206 vs 2,524 line up with one partition vs two (topic offsets after the run were HIGH 395+437+451 and LOW 1,200+1,338+1,213). This is two processes on one host, not a 2-node cluster. Mean exec time is the mock `EMAIL` handler, not real I/O.
+The 33/67 split follows Kafka’s assignment of **whole partitions**. Three partitions and two group members typically map **2 + 1**. HIGH 448 vs 824 and LOW 1,206 vs 2,524 match one partition vs two (end offsets: HIGH 395+437+451, LOW 1,200+1,338+1,213).
 
-**What this shows:** ingest is decoupled from execute. 50 rps of accepts does not require 50 rps of workers; the backlog sits on Kafka. Adding a second worker shares partitions, it does not magically split 50/50, and on this laptop the pair still completed far slower than the API ingested.
+Ingest and execute are decoupled: 50 rps of accepts does not require 50 rps of completions. The pair still lagged ingest on this laptop; Kafka held the remainder until drain. A second consumer shares partitions; it does not guarantee a 50/50 split. Mean exec time is the mock `EMAIL` handler, not external I/O. This is two processes on one host, not a two-node cluster.
 
-**Reproduce:** start both workers before k6, run the script, then compare `jobs_completed_total` per instance. Re-query Postgres until `PENDING` is 0 before quoting completion counts.
+Re-run: start both workers, then k6. Compare `jobs_completed_total` per instance. Quote completion counts only after `PENDING` is 0.
 
 ---
 
