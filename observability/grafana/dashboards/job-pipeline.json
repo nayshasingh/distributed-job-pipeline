@@ -1,0 +1,129 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Job submit rate (API)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_submitted_total[1m]))",
+          "legendFormat": "submitted",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "title": "Worker completions vs requeues",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_completed_total{outcome=\"SUCCESS\"}[1m]))",
+          "legendFormat": "SUCCESS",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(jobs_completed_total{outcome=\"REQUEUE\"}[1m]))",
+          "legendFormat": "REQUEUE",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(jobs_completed_total{outcome=\"FAILED\"}[1m]))",
+          "legendFormat": "FAILED",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "title": "Kafka consumer group lag",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (consumergroup, topic) (kafka_consumergroup_lag)",
+          "legendFormat": "{{consumergroup}} {{topic}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "title": "HikariCP pool (active / pending / max)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "hikaricp_connections_active",
+          "legendFormat": "active {{application}} {{pool}}",
+          "refId": "A"
+        },
+        {
+          "expr": "hikaricp_connections_pending",
+          "legendFormat": "pending {{application}} {{pool}}",
+          "refId": "B"
+        },
+        {
+          "expr": "hikaricp_connections_max",
+          "legendFormat": "max {{application}} {{pool}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "title": "POST /jobs latency (p95)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket{uri=\"/jobs\", method=\"POST\"}[1m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "title": "Redis lock skips (duplicate delivery / overlap)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_lock_skipped_total[1m]))",
+          "legendFormat": "lock skipped",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["job-pipeline"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "Job pipeline",
+  "uid": "job-pipeline",
+  "version": 1
+}

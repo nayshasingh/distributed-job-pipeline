@@ -88,6 +88,7 @@ services:
       context: ./job-worker
     environment:
       JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m"
+      SERVER_PORT: "8081"
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/jobscheduler
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
@@ -103,6 +104,12 @@ services:
         condition: service_healthy
       scheduler:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
     restart: unless-stopped
 
   dashboard:

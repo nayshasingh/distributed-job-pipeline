@@ -7,6 +7,7 @@ import com.distributedjob.scheduler.dto.JobCompletionRequest;
 import com.distributedjob.scheduler.dto.JobResponse;
 import com.distributedjob.scheduler.dto.JobSubmissionRequest;
 import com.distributedjob.scheduler.kafka.JobCreatedEvent;
+import com.distributedjob.scheduler.metrics.JobMetrics;
 import com.distributedjob.scheduler.repository.JobRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -31,14 +32,17 @@ public class JobService {
     private final JobRepository jobRepository;
     private final ObjectMapper objectMapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final JobMetrics jobMetrics;
 
     public JobService(
             JobRepository jobRepository,
             ObjectMapper objectMapper,
-            ApplicationEventPublisher eventPublisher) {
+            ApplicationEventPublisher eventPublisher,
+            JobMetrics jobMetrics) {
         this.jobRepository = jobRepository;
         this.objectMapper = objectMapper;
         this.eventPublisher = eventPublisher;
+        this.jobMetrics = jobMetrics;
     }
 
     @Transactional
@@ -58,6 +62,7 @@ public class JobService {
                 saved.getJobType(),
                 saved.getRetryCount());
         eventPublisher.publishEvent(new JobCreatedEvent(saved.getId(), saved.getJobType(), saved.getPriority()));
+        jobMetrics.submitted(priority);
         return toResponse(saved);
     }
 
@@ -93,6 +98,7 @@ public class JobService {
                 saved.getPriority(),
                 saved.getRetryCount());
         eventPublisher.publishEvent(new JobCreatedEvent(saved.getId(), saved.getJobType(), saved.getPriority()));
+        jobMetrics.retried(saved.getPriority());
         return toResponse(saved);
     }
 

@@ -1,6 +1,7 @@
-# Local infrastructure for the distributed job scheduler demo (PostgreSQL, Kafka, Redis).
+# Local infrastructure for the distributed job scheduler demo.
 # Usage: docker compose up -d
 # Then start the API and worker JVMs from each Maven module (see README).
+# Grafana: http://localhost:3001 (admin/admin)  Prometheus: http://localhost:9090
 
 services:
   postgres:
@@ -44,8 +45,50 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command:
+      - --kafka.server=kafka:29092
+    ports:
+      - "9308:9308"
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - kafka-exporter
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped

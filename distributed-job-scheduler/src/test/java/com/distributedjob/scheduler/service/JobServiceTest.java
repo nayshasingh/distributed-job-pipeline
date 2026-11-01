@@ -5,6 +5,7 @@ import com.distributedjob.scheduler.entity.Job;
 import com.distributedjob.scheduler.entity.JobPriority;
 import com.distributedjob.scheduler.entity.JobStatus;
 import com.distributedjob.scheduler.kafka.JobCreatedEvent;
+import com.distributedjob.scheduler.metrics.JobMetrics;
 import com.distributedjob.scheduler.repository.JobRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -16,6 +17,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.web.server.ResponseStatusException;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -39,7 +41,11 @@ class JobServiceTest {
 
     @BeforeEach
     void setUp() {
-        jobService = new JobService(jobRepository, new ObjectMapper(), eventPublisher);
+        jobService = new JobService(
+                jobRepository,
+                new ObjectMapper(),
+                eventPublisher,
+                new JobMetrics(new SimpleMeterRegistry()));
     }
 
     @Test

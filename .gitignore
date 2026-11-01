@@ -6,6 +6,9 @@
 job-dashboard/dist/
 **/.vite/
 
+# k6 local export (measured numbers live in README)
+load-tests/last-run.json
+
 # Env and secrets (keep .env.example tracked)
 .env
 **/.env

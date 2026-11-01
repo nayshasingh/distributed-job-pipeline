@@ -4,6 +4,8 @@ import com.distributedjob.worker.config.WorkerProperties;
 import com.distributedjob.worker.entity.Job;
 import com.distributedjob.worker.kafka.JobQueueKafkaProducer;
 import com.distributedjob.worker.kafka.JobQueueMessage;
+import com.distributedjob.worker.metrics.JobMetrics;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -20,18 +22,21 @@ public class JobProcessingService {
     private final WorkerProperties workerProperties;
     private final JobQueueKafkaProducer jobQueueKafkaProducer;
     private final JobDistributedLockService jobDistributedLockService;
+    private final JobMetrics jobMetrics;
 
     public JobProcessingService(
             JobStateService jobStateService,
             MockJobTaskExecutor mockJobTaskExecutor,
             WorkerProperties workerProperties,
             JobQueueKafkaProducer jobQueueKafkaProducer,
-            JobDistributedLockService jobDistributedLockService) {
+            JobDistributedLockService jobDistributedLockService,
+            JobMetrics jobMetrics) {
         this.jobStateService = jobStateService;
         this.mockJobTaskExecutor = mockJobTaskExecutor;
         this.workerProperties = workerProperties;
         this.jobQueueKafkaProducer = jobQueueKafkaProducer;
         this.jobDistributedLockService = jobDistributedLockService;
+        this.jobMetrics = jobMetrics;
     }
 
     public void processQueuedJob(JobQueueMessage message) {
@@ -42,6 +47,7 @@ public class JobProcessingService {
                     "event=job_skipped_lock_held jobId={} priority={}",
                     message.jobId(),
                     message.priority());
+            jobMetrics.lockSkipped(message.priority());
             return;
         }
         try {
@@ -51,10 +57,12 @@ public class JobProcessingService {
                         "event=job_skipped_not_claimable jobId={} priority={}",
                         message.jobId(),
                         message.priority());
+                jobMetrics.notClaimable(message.priority());
                 return;
             }
 
             Job job = claimed.get();
+            Timer.Sample sample = jobMetrics.startExecution();
             try {
                 log.info(
                         "event=job_processing_started jobId={} priority={} jobType={}",
@@ -63,6 +71,7 @@ public class JobProcessingService {
                         job.getJobType());
                 mockJobTaskExecutor.execute(job);
                 jobStateService.markSuccess(job.getId());
+                jobMetrics.succeeded(job.getPriority(), sample);
                 log.info(
                         "event=job_processing_succeeded jobId={} priority={} jobType={}",
                         job.getId(),
@@ -78,6 +87,8 @@ public class JobProcessingService {
                 ExecutionFailureResult outcome = jobStateService.recordExecutionFailure(
                         job.getId(),
                         workerProperties.maxExecutionAttempts());
+                boolean requeued = outcome.type() == ExecutionFailureResult.Type.REQUEUE;
+                jobMetrics.failed(job.getPriority(), sample, requeued);
                 switch (outcome.type()) {
                     case REQUEUE -> jobQueueKafkaProducer.sendJobQueued(outcome.republishMessage());
                     case TERMINAL_FAILED -> log.error(

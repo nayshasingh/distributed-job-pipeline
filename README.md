@@ -3,6 +3,40 @@
 This project is built around a concrete backend problem: **urgent background work gets delayed when mixed with bulk work**.  
 Example: a user-facing notification and a large report generation request should not have equal scheduling behavior.
 
+```mermaid
+flowchart LR
+  subgraph Clients
+    UI[React dashboard]
+    HTTP[HTTP / k6]
+  end
+  subgraph Apps
+    API[Scheduler API :8080]
+    W[Job workers]
+  end
+  subgraph Data
+    PG[(PostgreSQL jobs)]
+    K[[Kafka high / low topics]]
+    RD[(Redis locks)]
+  end
+  subgraph Observe
+    X[kafka-exporter]
+    P[Prometheus]
+    G[Grafana :3001]
+  end
+  UI --> API
+  HTTP --> API
+  API --> PG
+  API --> K
+  W --> K
+  W --> PG
+  W --> RD
+  API --> P
+  W --> P
+  X --> K
+  X --> P
+  P --> G
+```
+
 Instead of a single queue with ad-hoc retries, this repo implements a small production-inspired pipeline:
 
 - **Two priority lanes** (`HIGH`, `LOW`) with fair dispatch (**3:1**) so urgent work is preferred but low-priority work still progresses.
@@ -10,9 +44,9 @@ Instead of a single queue with ad-hoc retries, this repo implements a small prod
 - **Kafka-based asynchronous execution** between API and worker.
 - **Redis execution locks** to reduce duplicate processing when messages are redelivered.
 - **Stale RUNNING recovery** to reclaim jobs left RUNNING after worker crashes.
-- **Structured lifecycle logs** (`event=... jobId=...`) to make incident debugging easier.
+- **Structured lifecycle logs** (`event=... jobId=...`) plus **Micrometer → Prometheus → Grafana** for submit rate, consumer lag, and HikariCP pool usage.
 
-**Stack:** Spring Boot 3 · Java 21 · PostgreSQL · Kafka · Redis · optional React (Vite) dashboard  
+**Stack:** Spring Boot 3 · Java 21 · PostgreSQL · Kafka · Redis · Micrometer/Prometheus/Grafana · optional React (Vite) dashboard  
 **Deep dive:** [Architecture & workflow](docs/ARCHITECTURE_AND_WORKFLOW.md)  
 **Learning links:** [LEARNING_RESOURCES.md](docs/LEARNING_RESOURCES.md)
 
@@ -67,11 +101,13 @@ This repository focuses on those three issues with simple, explicit design choic
 10. [Priority-based Job Scheduling](#priority-based-job-scheduling)  
 11. [Distributed locking (Redis)](#distributed-locking-redis)  
 12. [Configuration and environment variables](#configuration-and-environment-variables)  
-13. [Prerequisites](#prerequisites)  
-14. [How to run](#how-to-run)  
-15. [Project structure](#project-structure)  
-16. [Design notes and limitations](#design-notes-and-limitations)  
-17. [Troubleshooting](#troubleshooting)  
+13. [Observability](#observability)  
+14. [Load test](#load-test)  
+15. [Prerequisites](#prerequisites)  
+16. [How to run](#how-to-run)  
+17. [Project structure](#project-structure)  
+18. [Design notes and limitations](#design-notes-and-limitations)  
+19. [Troubleshooting](#troubleshooting)  
 
 ---
 
@@ -340,6 +376,7 @@ See class-level documentation in
 | `KAFKA_JOB_QUEUE_HIGH_TOPIC` | `job-queue-high` | HIGH priority producer topic |
 | `KAFKA_JOB_QUEUE_LOW_TOPIC` | `job-queue-low` | LOW priority producer topic |
 | `spring.jpa.hibernate.ddl-auto` | `update` | Schema management |
+| Actuator | `/actuator/prometheus` | Micrometer scrape endpoint |
 
 ### Worker (`job-worker`)
 
@@ -358,7 +395,61 @@ See class-level documentation in
 | `JOB_WORKER_STALE_RECLAIM_INTERVAL_MS` | `30000` | How often the worker scans for stale `RUNNING` jobs |
 | `JOB_WORKER_LOCK_KEY_PREFIX` | `job-worker:exec:` | Redis key prefix |
 | `JOB_WORKER_LOCK_TTL_SECONDS` | `600` | Lock TTL (seconds) |
+| `SERVER_PORT` | `8081` | Actuator / Prometheus scrape port (no job HTTP API) |
 | `spring.jpa.hibernate.ddl-auto` | `validate` | Expect existing schema |
+
+---
+
+## Observability
+
+Local Compose starts **Prometheus** (`http://localhost:9090`), **Grafana** (`http://localhost:3001`, admin/admin), and **kafka-exporter**.
+
+The JVM apps are still started with Maven on the host. Prometheus scrapes them via `host.docker.internal`:
+
+| Target | Metrics |
+|--------|---------|
+| Scheduler `:8080/actuator/prometheus` | `jobs_submitted_total`, `http_server_requests_seconds_*`, HikariCP (`pool=scheduler`) |
+| Worker `:8081/actuator/prometheus` (second instance `:8082`) | `jobs_completed_total`, `jobs_lock_skipped_total`, `jobs_execution_seconds_*`, HikariCP (`pool=worker`) |
+| kafka-exporter `:9308` | `kafka_consumergroup_lag` by group and topic |
+
+Grafana dashboard **Job pipeline** is provisioned automatically. It is a **local demo**, not a hosted production stack: do not expose Grafana on a public VM without auth.
+
+---
+
+## Load test
+
+[`load-tests/submit-jobs.js`](load-tests/submit-jobs.js) uses [k6](https://k6.io/) to send **5,000** `POST /jobs` calls at **50 requests/second** for 100 seconds. That is **not** 5,000 concurrent clients.
+
+1. Start Compose, the scheduler, and at least one worker (see [How to run](#how-to-run)). Close the React dashboard during the run — `GET /jobs` loads the full table and will distort API latency.
+2. Install k6 (`brew install k6` on macOS).
+3. Run:
+
+```bash
+k6 run load-tests/submit-jobs.js
+```
+
+4. In Grafana, watch submit rate, Kafka lag, HikariCP active connections, and `jobs_lock_skipped`.
+5. After workers catch up, check Postgres (default local password is `123`):
+
+```bash
+docker compose exec postgres psql -U postgres -d jobscheduler -c \
+  "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY 1;"
+```
+
+### Measured result (1 Nov 2026, one laptop, one worker)
+
+**Setup:** Docker Compose (Postgres 16, Kafka 7.5, Redis 7) on a MacBook; scheduler and **one** `job-worker` JVM on the host; k6 `constant-arrival-rate` 50/s for 100s; job type `EMAIL` (mock executor returns immediately). About 30 rows already existed from earlier manual tests, including one `FAILING_JOB`.
+
+| Stage | What we measured |
+|-------|------------------|
+| **Intake (k6)** | **5,001** `POST /jobs`, **100% HTTP 201**, **0%** failed, p50 **2.9ms**, p95 **4.9ms**, max **57.5ms**. k6 used at most **20** VUs. |
+| **Right after the burst** | Postgres: **2,438 SUCCESS**, **2,592 PENDING**, **1 FAILED**. The API had finished; the worker had not. |
+| **While draining** | One worker cleared the backlog at about **4 jobs/s**. Kafka/Postgres `PENDING` fell steadily (no stuck `RUNNING` pile-up). |
+| **After drain** | **5,030 SUCCESS**, **1 FAILED**, **0 PENDING**. By priority: HIGH **1,283** SUCCESS, LOW **3,747** SUCCESS + **1** FAILED. |
+
+**What this shows:** submit and execute are decoupled. The HTTP API absorbed 50 jobs/s without errors while a single worker ran at ~4 completions/s. The backlog lived in Kafka + Postgres, then drained to terminal SUCCESS. It does **not** show 5,000 concurrent clients, multi-node workers, or “zero duplication under cluster load.”
+
+**Reproduce:** same commands as above, then re-query Postgres until `PENDING` is 0 before you quote completion counts.
 
 ---
 
@@ -366,7 +457,8 @@ See class-level documentation in
 
 - **Java 21** (matches both Maven modules’ `pom.xml`)
 - **Maven 3.8+**
-- **Docker** (optional but recommended) — for [`docker-compose.yml`](docker-compose.yml)
+- **Docker** (optional but recommended) — for [`docker-compose.yml`](docker-compose.yml) (Postgres, Kafka, Redis, Prometheus, Grafana)
+- **k6** (optional) — for [`load-tests/submit-jobs.js`](load-tests/submit-jobs.js)
 - Or install locally: **PostgreSQL 14+**, **Apache Kafka** (or compatible), **Redis 6+**
 
 ---
@@ -381,7 +473,7 @@ From the repository root:
 docker compose up -d
 ```
 
-Wait until Postgres, Redis, and Kafka are healthy (Postgres healthcheck in compose; Kafka may need ~30s).
+Wait until Postgres, Redis, and Kafka are healthy (Postgres healthcheck in compose; Kafka may need ~30s). Grafana is **http://localhost:3001**.
 
 **Create database manually** (only if you use Postgres without the compose `POSTGRES_DB`):
 
@@ -407,6 +499,13 @@ Open another terminal per worker:
 ```bash
 cd job-worker
 mvn spring-boot:run
+```
+
+Actuator for this process is **http://localhost:8081/actuator/prometheus**. A second worker:
+
+```bash
+cd job-worker
+SERVER_PORT=8082 mvn spring-boot:run
 ```
 
 Workers need:
@@ -563,7 +662,9 @@ If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5
 ```text
 .
 ├── README.md                 # This file
-├── docker-compose.yml        # Postgres, Redis, Zookeeper, Kafka
+├── docker-compose.yml        # Postgres, Redis, Kafka, Prometheus, Grafana
+├── observability/            # Prometheus scrape config + Grafana dashboard
+├── load-tests/               # k6 submit burst (5k POSTs at 50 rps)
 ├── job-dashboard/            # React + Tailwind + Axios UI (npm start)
 ├── distributed-job-scheduler/
 │   ├── pom.xml
@@ -608,7 +709,9 @@ If any step fails, use [Troubleshooting](#troubleshooting) and confirm ports **5
 | Worker fails at startup with JPA / schema errors | `jobs` table missing | Run the **scheduler** once first (`ddl-auto: update`). |
 | Worker cannot connect to Redis | Redis not running | `docker compose up -d` or start Redis; check `REDIS_HOST`. |
 | No consumption from Kafka | Broker address wrong | `KAFKA_BOOTSTRAP_SERVERS`; from host use `localhost:9092` with provided compose. |
-| Jobs stay PENDING, no worker logs | Consumer group lag / wrong topic | Confirm topics `job-queue-high` / `job-queue-low` exist and scheduler logs show a publish; worker uses groups `job-worker-high` / `job-worker-low`. |
+| Jobs stay PENDING, no worker logs | Consumer group lag / wrong topic | Confirm topics `job-queue-high` / `job-queue-low` exist and scheduler logs show a publish; worker uses groups `job-worker-high` / `job-worker-low`. Grafana **Kafka consumer group lag** should rise if the API is publishing and workers are down. |
+| Grafana empty / Prometheus target down | JVM apps not running, or scrape host wrong | Start scheduler on 8080 and worker on 8081. Prometheus uses `host.docker.internal`. On Linux, Compose sets `host-gateway`. |
+| Second worker fails to bind 8081 | Port already used | `SERVER_PORT=8082 mvn spring-boot:run` |
 | `FAILING_JOB` never goes SUCCESS | By design | Use a normal `jobType` for success path. |
 
 ---

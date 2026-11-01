@@ -6,6 +6,8 @@ import com.distributedjob.worker.entity.JobPriority;
 import com.distributedjob.worker.entity.JobStatus;
 import com.distributedjob.worker.kafka.JobQueueKafkaProducer;
 import com.distributedjob.worker.kafka.JobQueueMessage;
+import com.distributedjob.worker.metrics.JobMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -42,7 +44,8 @@ class JobProcessingServiceTest {
                 mockJobTaskExecutor,
                 new WorkerProperties(4, 900, "job-worker:exec:", 600),
                 jobQueueKafkaProducer,
-                jobDistributedLockService);
+                jobDistributedLockService,
+                new JobMetrics(new SimpleMeterRegistry()));
     }
 
     @Test
